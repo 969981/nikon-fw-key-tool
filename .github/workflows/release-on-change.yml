@@ -1,0 +1,77 @@
+# An original project has no external upstream to merge.
+# Publish verified, firmware-free source snapshots whenever this repo changes.
+name: Verify and release Nikon firmware tools
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '47 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nikon-tools-release
+  cancel-in-progress: false
+
+jobs:
+  test-and-release:
+    if: github.repository == '969981/nikon-fw-key-tool'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Python dependencies
+        run: python -m pip install --upgrade pip numpy
+      - name: Run synthetic validation tests (no firmware)
+        run: python -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Check exact commit release
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          tag="source-${sha:0:12}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo 'new=false' >> "$GITHUB_OUTPUT"
+          else
+            echo 'new=true' >> "$GITHUB_OUTPUT"
+          fi
+      - name: Assemble firmware-free source archive and checksums
+        if: steps.release.outputs.new == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          git archive --format=tar --prefix=nikon-fw-key-tool/ HEAD | gzip -n > "dist/nikon-fw-key-tool-${GITHUB_SHA:0:12}.tar.gz"
+          (cd dist && sha256sum *.tar.gz > SHA256SUMS)
+          # No vendor firmware images, model-specific key files, or extracted blobs.
+      - name: Publish verified source-only release
+        if: steps.release.outputs.new == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+          SHA: ${{ steps.release.outputs.sha }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            exit 0
+          fi
+          gh release create "$TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$SHA" \
+            --title "Nikon firmware tools ${SHA:0:12}" \
+            --notes 'Verified Python source snapshot. Unit tests passed with synthetic fixtures. No Nikon firmware images or recovered keys included.' \
+            --prerelease
